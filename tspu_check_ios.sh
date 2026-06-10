@@ -72,6 +72,18 @@ drill_ipv4() {
     '
 }
 
+get_local_ipv4() {
+    ip -4 addr show | awk '
+        /inet / {
+            split($2, addr, "/")
+            if (addr[1] != "127.0.0.1") {
+                print addr[1]
+                exit
+            }
+        }
+    '
+}
+
 # Универсальный nc для UDP прослушивания
 udp_listen() {
     local port=$1
@@ -302,7 +314,7 @@ start_web_server() {
         return
     fi
     
-    LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+    LOCAL_IP=$(get_local_ipv4)
     [ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
     
     if sudo lsof -i :443 2>/dev/null | grep -q LISTEN; then
@@ -410,7 +422,7 @@ check_my_ip() {
     print_header
     echo -e "${YELLOW}[10] 🌍 Определение вашего IP...${NC}\n"
     
-    local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+    local_ip=$(get_local_ipv4)
     if [ -n "$local_ip" ]; then
         echo -e "  Внутренний IP: ${GREEN}$local_ip${NC}"
     else
@@ -620,7 +632,7 @@ check_nat_type() {
         CGNAT_DETECTED=false
     fi
     
-    local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+    local_ip=$(get_local_ipv4)
     if [ -n "$local_ip" ] && [ "$local_ip" = "$external_ip" ]; then
         echo -e "  ${GREEN}✅ IP совпадает → прямое подключение возможно${NC}"
     elif [ -n "$local_ip" ]; then
