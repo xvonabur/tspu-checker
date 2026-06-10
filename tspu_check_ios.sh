@@ -73,7 +73,9 @@ drill_ipv4() {
 }
 
 get_local_ipv4() {
-    ip -4 addr show | awk '
+    local local_ip
+
+    local_ip=$(ip -4 addr show 2>/dev/null | awk '
         /inet / {
             split($2, addr, "/")
             if (addr[1] != "127.0.0.1") {
@@ -81,7 +83,52 @@ get_local_ipv4() {
                 exit
             }
         }
+    ')
+
+    if [ -n "$local_ip" ]; then
+        echo "$local_ip"
+        return
+    fi
+
+    ifconfig 2>/dev/null | awk '
+        /inet / {
+            ip = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "inet") {
+                    ip = $(i + 1)
+                } else if ($i ~ /^addr:/) {
+                    sub(/^addr:/, "", $i)
+                    ip = $i
+                }
+            }
+            sub(/\/.*/, "", ip)
+            if (ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && ip != "127.0.0.1") {
+                print ip
+                exit
+            }
+        }
     '
+}
+
+run_ip_cmd() {
+    if ! command -v ip >/dev/null 2>&1; then
+        echo -e "${RED}❌ Команда ip недоступна в этой системе.${NC}"
+        return 1
+    fi
+
+    if sudo ip "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo -e "${RED}❌ Не удалось выполнить: ip $*${NC}"
+    echo -e "${YELLOW}   В этом окружении команда ip может не поддерживаться.${NC}"
+    return 1
+}
+
+cleanup_wg_interface() {
+    if command -v ip >/dev/null 2>&1; then
+        sudo ip link del "$WG_INTERFACE" >/dev/null 2>&1
+    fi
 }
 
 # Универсальный nc для UDP прослушивания
@@ -637,6 +684,8 @@ check_nat_type() {
         echo -e "  ${GREEN}✅ IP совпадает → прямое подключение возможно${NC}"
     elif [ -n "$local_ip" ]; then
         echo -e "  ${YELLOW}⚠️ IP не совпадает (локальный: $local_ip) → вы за NAT${NC}"
+    else
+        echo -e "  ${YELLOW}⚠️ Внутренний IP: не удалось определить${NC}"
     fi
     
     echo -e "\n${BLUE}📊 ВЕРДИКТ:${NC}"
@@ -645,6 +694,9 @@ check_nat_type() {
         echo -e "     Решения: туннелирование (Cloudflare Tunnel, ngrok) или VPN-подключения только исходящие"
     elif [ -n "$local_ip" ] && [ "$local_ip" != "$external_ip" ]; then
         echo -e "  ${YELLOW}⚠️ Вы за NAT. Входящие соединения возможны после настройки проброса портов.${NC}"
+    elif [ -z "$local_ip" ]; then
+        echo -e "  ${YELLOW}❓ Не удалось определить тип NAT по локальному IP.${NC}"
+        echo -e "     Внешний IP не CGNAT, но прямое подключение не подтверждено."
     else
         echo -e "  ${GREEN}✅ Прямое подключение. Входящие соединения должны работать.${NC}"
     fi
@@ -786,10 +838,30 @@ EOF
         
         sed -i "s|PLACEHOLDER|$CLIENT_PUBLIC|" /tmp/wgtest_server.conf
         
-        sudo ip link add dev $WG_INTERFACE type wireguard
-        sudo ip addr add 10.0.0.1/24 dev $WG_INTERFACE
-        sudo wg setconf $WG_INTERFACE /tmp/wgtest_server.conf
-        sudo ip link set $WG_INTERFACE up
+        if ! run_ip_cmd link add dev "$WG_INTERFACE" type wireguard; then
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
+        if ! run_ip_cmd addr add 10.0.0.1/24 dev "$WG_INTERFACE"; then
+            cleanup_wg_interface
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
+        if ! sudo wg setconf "$WG_INTERFACE" /tmp/wgtest_server.conf >/dev/null 2>&1; then
+            echo -e "${RED}❌ Не удалось применить WireGuard конфигурацию${NC}"
+            cleanup_wg_interface
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
+        if ! run_ip_cmd link set "$WG_INTERFACE" up; then
+            cleanup_wg_interface
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
         
         echo -e "\n${GREEN}✅ WireGuard сервер запущен на порту $WG_PORT${NC}\n"
         
@@ -800,7 +872,7 @@ EOF
         echo -e "\n${CYAN}📊 Статистика WireGuard:${NC}"
         sudo wg show $WG_INTERFACE
         
-        sudo ip link del $WG_INTERFACE
+        cleanup_wg_interface
         rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
         
         echo -e "\n${GREEN}✅ Тест завершён${NC}"
@@ -846,10 +918,30 @@ Endpoint = $SERVER_IP:$SERVER_PORT
 PersistentKeepalive = 25
 EOF
         
-        sudo ip link add dev $WG_INTERFACE type wireguard
-        sudo ip addr add 10.0.0.2/24 dev $WG_INTERFACE
-        sudo wg setconf $WG_INTERFACE /tmp/wgtest_client.conf
-        sudo ip link set $WG_INTERFACE up
+        if ! run_ip_cmd link add dev "$WG_INTERFACE" type wireguard; then
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
+        if ! run_ip_cmd addr add 10.0.0.2/24 dev "$WG_INTERFACE"; then
+            cleanup_wg_interface
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
+        if ! sudo wg setconf "$WG_INTERFACE" /tmp/wgtest_client.conf >/dev/null 2>&1; then
+            echo -e "${RED}❌ Не удалось применить WireGuard конфигурацию${NC}"
+            cleanup_wg_interface
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
+        if ! run_ip_cmd link set "$WG_INTERFACE" up; then
+            cleanup_wg_interface
+            rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
+            pause
+            return
+        fi
         
         echo -e "\n${GREEN}✅ WireGuard клиент запущен${NC}"
         sleep 3
@@ -884,7 +976,7 @@ EOF
         echo -e "\n${CYAN}📊 Статистика WireGuard:${NC}"
         sudo wg show $WG_INTERFACE
         
-        sudo ip link del $WG_INTERFACE
+        cleanup_wg_interface
         rm -f /tmp/wgtest_*.key /tmp/wgtest_*.conf
         
     else
